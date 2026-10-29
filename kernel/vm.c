@@ -293,36 +293,61 @@ uvmfree(pagetable_t pagetable, uint64 sz)
 // physical memory.
 // returns 0 on success, -1 on failure.
 // frees any allocated pages on failure.
+
 int
 uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
 {
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
 
-  for(i = 0; i < sz; i += PGSIZE){
-    if((pte = walk(old, i, 0)) == 0)
-      continue;   // page table entry hasn't been allocated
-    if((*pte & PTE_V) == 0)
-      continue;   // physical page hasn't been allocated
+  // First build all child mappings.
+  for (i = 0; i < sz; i += PGSIZE) {
+    pte = walk(old, i, 0);
+    if (pte == 0)
+      continue;
+    if ((*pte & PTE_V) == 0)
+      continue;
+
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+
+    // Originally writable pages become COW.
+    // Preserve existing COW flags and read-only permissions.
+    if (flags & PTE_W)
+      flags = (flags & ~PTE_W) | PTE_COW;
+
+    // Add one reference for the child's mapping.
+    kref_inc((void *)pa);
+
+    if (mappages(new, i, PGSIZE, pa, flags) != 0) {
+      // No mapping was installed; undo this reference.
+      kfree((void *)pa);
       goto err;
     }
   }
+
+  // All child mappings succeeded. Now protect the parent.
+  for (i = 0; i < sz; i += PGSIZE) {
+    pte = walk(old, i, 0);
+    if (pte == 0)
+      continue;
+    if ((*pte & PTE_V) == 0)
+      continue;
+
+    if (*pte & PTE_W)
+      *pte = (*pte & ~PTE_W) | PTE_COW;
+  }
+
+  // Flush stale translations after changing parent permissions.
+  sfence_vma();
   return 0;
 
- err:
+err:
+  // Remove completed child mappings and drop their references.
   uvmunmap(new, 0, i / PGSIZE, 1);
   return -1;
 }
-
 // mark a PTE invalid for user access.
 // used by exec for the user stack guard page.
 void
@@ -358,10 +383,30 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     }
 
     pte = walk(pagetable, va0, 0);
-    // forbid copyout over read-only user text pages.
-    if((*pte & PTE_W) == 0)
+    if (pte == 0 ||
+        (*pte & PTE_V) == 0 ||
+        (*pte & PTE_U) == 0)
       return -1;
-      
+
+    // Make a COW page private before writing into it.
+    if (*pte & PTE_COW) {
+      if (cow_resolve(pagetable, va0) < 0)
+        return -1;
+
+      // COW changed the mapping: refresh the physical address.
+      pa0 = walkaddr(pagetable, va0);
+      if (pa0 == 0)
+        return -1;
+
+      pte = walk(pagetable, va0, 0);
+      if (pte == 0)
+        return -1;
+    }
+
+    // Ordinary read-only pages must remain read-only.
+    if ((*pte & PTE_W) == 0)
+      return -1;
+
     n = PGSIZE - (dstva - va0);
     if(n > len)
       n = len;
@@ -449,15 +494,75 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 // that was lazily allocated in sys_sbrk().
 // returns 0 if va is invalid or already mapped, or if
 // out of physical memory, and physical address if successful.
+// Make an existing COW user page private and writable.
+// Return 0 on success, -1 on failure.
+int
+cow_resolve(pagetable_t pagetable, uint64 va)
+{
+  pte_t *pte;
+  uint64 oldpa;
+  uint flags;
+  char *mem;
+
+  if (va >= MAXVA)
+    return -1;
+
+  va = PGROUNDDOWN(va);
+
+  pte = walk(pagetable, va, 0);
+  if (pte == 0)
+    return -1;
+
+  if ((*pte & PTE_V) == 0 ||
+      (*pte & PTE_U) == 0 ||
+      (*pte & PTE_COW) == 0)
+    return -1;
+
+  if ((*pte & PTE_R) == 0 || (*pte & PTE_W) != 0)
+    return -1;
+
+  oldpa = PTE2PA(*pte);
+  flags = PTE_FLAGS(*pte);
+
+  mem = kalloc();
+  if (mem == 0)
+    return -1;
+
+  memmove(mem, (void *)oldpa, PGSIZE);
+
+  flags = (flags | PTE_W) & ~PTE_COW;
+  *pte = PA2PTE((uint64)mem) | flags;
+
+  sfence_vma();
+  kfree((void *)oldpa);
+
+  return 0;
+}
+
 uint64
 vmfault(pagetable_t pagetable, uint64 va, int read)
 {
   uint64 mem;
   struct proc *p = myproc();
 
-  if (va >= p->sz)
+  if (va >= p->sz || va >= MAXVA)
     return 0;
+  
   va = PGROUNDDOWN(va);
+  
+  pte_t *pte = walk(pagetable, va, 0);
+
+  if (pte != 0 && (*pte & PTE_V)) {
+    // Existing mappings can only be repaired for COW writes.
+    if (read != 0)
+      return 0;
+
+    if (cow_resolve(pagetable, va) < 0)
+      return 0;
+
+    return PTE2PA(*pte);
+  }
+  
   if(ismapped(pagetable, va)) {
     return 0;
   }
@@ -465,7 +570,7 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
   if(mem == 0)
     return 0;
   memset((void *) mem, 0, PGSIZE);
-  if (mappages(p->pagetable, va, PGSIZE, mem, PTE_W|PTE_U|PTE_R) != 0) {
+  if (mappages(pagetable, va, PGSIZE, mem, PTE_W|PTE_U|PTE_R) != 0) {
     kfree((void *)mem);
     return 0;
   }
