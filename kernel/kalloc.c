@@ -23,6 +23,11 @@ struct {
   struct run *freelist;
 } kmem;
 
+#define PA2IDX(pa) (((uint64)(pa) - KERNBASE) / PGSIZE)
+#define MAX_PAGES ((PHYSTOP - KERNBASE) / PGSIZE)
+
+uint8 ref_counts[MAX_PAGES];
+
 void
 kinit()
 {
@@ -47,16 +52,30 @@ void
 kfree(void *pa)
 {
   struct run *r;
+  int idx;
 
   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
+
+  idx = PA2IDX(pa);
+
+  acquire(&kmem.lock);
+
+  if (ref_counts[idx] > 1){
+    ref_counts[idx]--;
+    release(&kmem.lock);
+    return;
+  }
+
+  if (ref_counts[idx] > 0) {
+    ref_counts[idx]--;
+  }
 
   // Fill with junk to catch dangling refs.
   memset(pa, 1, PGSIZE);
 
   r = (struct run*)pa;
 
-  acquire(&kmem.lock);
   r->next = kmem.freelist;
   kmem.freelist = r;
   release(&kmem.lock);
@@ -72,11 +91,28 @@ kalloc(void)
 
   acquire(&kmem.lock);
   r = kmem.freelist;
-  if(r)
+  if(r) {
     kmem.freelist = r->next;
+    ref_counts[PA2IDX(r)] = 1;
+  }
   release(&kmem.lock);
 
   if(r)
     memset((char*)r, 5, PGSIZE); // fill with junk
   return (void*)r;
+}
+
+void
+kref_inc(void *pa)
+{
+  int idx;
+
+  if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+    panic("kref_inc");
+
+  idx = PA2IDX(pa);
+
+  acquire(&kmem.lock);
+  ref_counts[idx]++;
+  release(&kmem.lock);
 }
