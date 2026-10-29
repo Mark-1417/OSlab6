@@ -293,36 +293,61 @@ uvmfree(pagetable_t pagetable, uint64 sz)
 // physical memory.
 // returns 0 on success, -1 on failure.
 // frees any allocated pages on failure.
+
 int
 uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
 {
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
 
-  for(i = 0; i < sz; i += PGSIZE){
-    if((pte = walk(old, i, 0)) == 0)
-      continue;   // page table entry hasn't been allocated
-    if((*pte & PTE_V) == 0)
-      continue;   // physical page hasn't been allocated
+  // First build all child mappings.
+  for (i = 0; i < sz; i += PGSIZE) {
+    pte = walk(old, i, 0);
+    if (pte == 0)
+      continue;
+    if ((*pte & PTE_V) == 0)
+      continue;
+
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+
+    // Originally writable pages become COW.
+    // Preserve existing COW flags and read-only permissions.
+    if (flags & PTE_W)
+      flags = (flags & ~PTE_W) | PTE_COW;
+
+    // Add one reference for the child's mapping.
+    kref_inc((void *)pa);
+
+    if (mappages(new, i, PGSIZE, pa, flags) != 0) {
+      // No mapping was installed; undo this reference.
+      kfree((void *)pa);
       goto err;
     }
   }
+
+  // All child mappings succeeded. Now protect the parent.
+  for (i = 0; i < sz; i += PGSIZE) {
+    pte = walk(old, i, 0);
+    if (pte == 0)
+      continue;
+    if ((*pte & PTE_V) == 0)
+      continue;
+
+    if (*pte & PTE_W)
+      *pte = (*pte & ~PTE_W) | PTE_COW;
+  }
+
+  // Flush stale translations after changing parent permissions.
+  sfence_vma();
   return 0;
 
- err:
+err:
+  // Remove completed child mappings and drop their references.
   uvmunmap(new, 0, i / PGSIZE, 1);
   return -1;
 }
-
 // mark a PTE invalid for user access.
 // used by exec for the user stack guard page.
 void
